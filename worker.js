@@ -129,6 +129,83 @@ function xeroLastDay(month) { /* 'YYYY-MM' -> 'YYYY-MM-DD' */
   return month + '-' + String(d.getUTCDate()).padStart(2, '0');
 }
 
+/* ---------------- Square helpers (POS adapter: transaction COUNT only) ---------------- */
+const SQUARE_BASE = 'https://connect.squareup.com';
+const SQUARE_VERSION = '2024-10-17';
+function posHeaders(env) {
+  return { 'Authorization': 'Bearer ' + (env.POS_API_TOKEN || ''), 'Square-Version': SQUARE_VERSION,
+           'Content-Type': 'application/json', 'Accept': 'application/json' };
+}
+function tzOffsetMs(ms, tz) {
+  const f = new Intl.DateTimeFormat('en-US', { timeZone: tz, hourCycle: 'h23', year: 'numeric', month: '2-digit',
+    day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit' });
+  const p = {}; f.formatToParts(new Date(ms)).forEach(function (x) { p[x.type] = x.value; });
+  return Date.UTC(+p.year, +p.month - 1, +p.day, +p.hour, +p.minute, +p.second) - ms;
+}
+/* Local wall-clock 'YYYY-MM-DD' + hours in a timezone -> UTC ISO string. */
+function zonedToUtcIso(dateStr, tz, hours) {
+  const a = dateStr.split('-').map(Number);
+  const guess = Date.UTC(a[0], a[1] - 1, a[2], hours || 0, 0, 0);
+  let ms = guess - tzOffsetMs(guess, tz);
+  ms = guess - tzOffsetMs(ms, tz);
+  return new Date(ms).toISOString();
+}
+function addDaysStr(s, n) {
+  const a = s.split('-').map(Number);
+  return new Date(Date.UTC(a[0], a[1] - 1, a[2] + n)).toISOString().slice(0, 10);
+}
+/* Business name + active locations (cached an hour per token). */
+async function posInfo(env, h) {
+  const tok = String(env.POS_API_TOKEN || '');
+  const key = 'posinfo:' + tok.slice(-8);
+  const raw = await env.TOKENS.get(key);
+  if (raw) { try { return JSON.parse(raw); } catch (e) {} }
+  const hdr = { headers: posHeaders(env) };
+  const locs = await h.fetchJson(SQUARE_BASE + '/v2/locations', hdr);
+  let name = '';
+  try { const m = await h.fetchJson(SQUARE_BASE + '/v2/merchants/me', hdr); name = (m.merchant && m.merchant.business_name) || ''; } catch (e) {}
+  let list = (locs.locations || []).filter(function (l) { return l.status === 'ACTIVE'; })
+    .map(function (l) { return { id: l.id, name: l.name }; });
+  const only = String(env.POS_LOCATION_IDS || '').split(',').map(function (s) { return s.trim(); }).filter(Boolean);
+  if (only.length) list = list.filter(function (l) { return only.indexOf(l.id) >= 0; });
+  const info = { name: name, locations: list.slice(0, 10) };
+  await env.TOKENS.put(key, JSON.stringify(info), { expirationTtl: 3600 });
+  return info;
+}
+/* Count completed sales (not voids/cancels; refund-only orders are not sales) in a local date range. */
+async function posCount(env, h, q, budget) {
+  const info = await posInfo(env, h);
+  if (!info.locations.length) { const e = new Error('no locations'); e.status = 403; throw e; }
+  const hours = +q.rollover || 0;
+  const startAt = zonedToUtcIso(q.from, q.tz, hours);
+  const endAt = zonedToUtcIso(addDaysStr(q.to, 1), q.tz, hours);
+  const cacheKey = 'poscount:' + [q.from, q.to, q.tz, hours, info.locations.map(function (l) { return l.id; }).join('+')].join('|');
+  const today = new Date().toISOString().slice(0, 10);
+  const cached = await env.TOKENS.get(cacheKey);
+  if (cached !== null && cached !== undefined) { const n = parseInt(cached, 10); if (!isNaN(n)) return n; }
+  const body = {
+    location_ids: info.locations.map(function (l) { return l.id; }), limit: 1000,
+    query: { filter: { state_filter: { states: ['COMPLETED'] },
+                       date_time_filter: { closed_at: { start_at: startAt, end_at: endAt } } },
+             sort: { sort_field: 'CLOSED_AT', sort_order: 'ASC' } }
+  };
+  let count = 0, cursor = null, pages = 0;
+  do {
+    if (budget && budget.left-- <= 0) { const e = new Error('budget'); e.status = 429; throw e; }
+    const res = await h.fetchJson(SQUARE_BASE + '/v2/orders/search', {
+      method: 'POST', headers: posHeaders(env), body: JSON.stringify(cursor ? Object.assign({}, body, { cursor: cursor }) : body)
+    });
+    (res.orders || []).forEach(function (o) {
+      if (o.state === 'COMPLETED' && Array.isArray(o.line_items) && o.line_items.length > 0) count++;
+    });
+    cursor = res.cursor || null; pages++;
+  } while (cursor && pages < 60);
+  /* Past periods are settled (allow a day for offline-mode sales to arrive); today's range is not cached here. */
+  const settled = q.to < addDaysStr(today, -3);
+  try { await env.TOKENS.put(cacheKey, String(count), { expirationTtl: settled ? 86400 : 300 }); } catch (e) {}
+  return count;
+}
+
 const ADAPTERS = {
 
   /* >>> ADAPTER 1: ACCOUNTING (connect this FIRST - it feeds most of the board)
@@ -217,12 +294,30 @@ const ADAPTERS = {
      connect.squareupsandbox.com.
   */
   pos: {
-    configured: false,
-    auth: null,
+    configured: true,
+    auth: 'token',
     oauth: {},
-    async status(env, h) { return { connected: false }; },
-    async fetchRange(env, h, q) { throw new NotConfigured('pos'); },
-    async fetchMonthly(env, h, q) { throw new NotConfigured('pos'); }
+    async status(env, h) {
+      if (!env.POS_API_TOKEN) return { connected: false };
+      const info = await posInfo(env, h);
+      const names = info.locations.map(function (l) { return l.name; }).join(', ');
+      return { connected: true, org: (info.name ? info.name + ' - ' : '') + names, sandbox: false };
+    },
+    async fetchRange(env, h, q) {
+      const n = await posCount(env, h, { from: q.from, to: q.to, tz: q.tz, rollover: q.rollover }, { left: 40 });
+      return { count: n };
+    },
+    async fetchMonthly(env, h, q) {
+      const months = monthList(q.fromMonth, q.toMonth);
+      const out = { months: months, count: months.map(function () { return null; }) };
+      const budget = { left: 40 };
+      for (let i = months.length - 1; i >= 0; i--) { /* newest first, so recent months fill first */
+        try {
+          out.count[i] = await posCount(env, h, { from: months[i] + '-01', to: xeroLastDay(months[i]), tz: q.tz, rollover: q.rollover }, budget);
+        } catch (e) { if (e && e.message === 'budget') break; throw e; }
+      }
+      return out;
+    }
   },
 
   /* >>> ADAPTER 3: ROSTERING (optional - only if the owner has one)
