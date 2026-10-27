@@ -22,6 +22,7 @@ rules = [
 # 4+ also auto-creates it, or paste a real id here.)
 [[kv_namespaces]]
 binding = "TOKENS"
+id = "e221622ff08643fd845355cfeef7a18c"
 # id is omitted so the FIRST deploy/import auto-provisions the namespace (an empty
 # string "" does NOT trigger that - it must be absent). THEN PIN IT: after the
 # first successful deploy, read the provisioned id from the Cloudflare dashboard
