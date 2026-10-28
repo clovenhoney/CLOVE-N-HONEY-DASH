@@ -411,10 +411,17 @@ const ADAPTERS = {
       const months = monthList(q.fromMonth, q.toMonth);
       const out = { months: months, count: months.map(function () { return null; }) };
       const budget = q.posBudget || { left: 30 };
-      for (let i = months.length - 1; i >= 0; i--) { /* newest first, so recent months fill first */
-        try {
-          out.count[i] = await posCount(env, h, { from: months[i] + '-01', to: xeroLastDay(months[i]), tz: q.tz, rollover: q.rollover, loc: q.loc }, budget);
-        } catch (e) { if (e && e.budget) { if (q.posBudget) q.posBudget.pending = true; break; } throw e; }
+      /* newest first, several months at once (each month is its own Square query) */
+      const order = months.map(function (m, i) { return i; }).reverse();
+      for (let b = 0; b < order.length; b += 6) {
+        const batch = order.slice(b, b + 6);
+        let ranOut = false;
+        await Promise.all(batch.map(async function (i) {
+          try {
+            out.count[i] = await posCount(env, h, { from: months[i] + '-01', to: xeroLastDay(months[i]), tz: q.tz, rollover: q.rollover, loc: q.loc }, budget);
+          } catch (e) { if (e && e.budget) { ranOut = true; if (q.posBudget) q.posBudget.pending = true; return; } throw e; }
+        }));
+        if (ranOut) break;
       }
       return out;
     }
@@ -988,9 +995,12 @@ async function apiMetrics(env, url) {
   }
   if (!data) {
     const periods = {};
-    periods.cur = await fetchSlot(env, { ...base, ...cur });
-    periods.prev = prev ? await fetchSlot(env, { ...base, ...prev }) : null;
-    periods.yoy = yoy ? await fetchSlot(env, { ...base, ...yoy }) : null;
+    const slots = await Promise.all([
+      fetchSlot(env, { ...base, ...cur }),
+      prev ? fetchSlot(env, { ...base, ...prev }) : null,
+      yoy ? fetchSlot(env, { ...base, ...yoy }) : null
+    ]);
+    periods.cur = slots[0]; periods.prev = slots[1]; periods.yoy = slots[2];
 
     let trendOut = null;
     if (trend) {
