@@ -237,39 +237,69 @@ function posLocationsFor(info, locKey) {
     + (info.locations.map(function (l) { return l.name; }).join(', ') || 'none') + '.');
   return locs;
 }
-/* Count completed sales (not voids/cancels; refund-only orders are not sales) in a local date range. */
+/* Count completed orders (voids/cancels excluded by state) in a local date range.
+   Built to fit Cloudflare's FREE plan (10 ms CPU, 50 subrequests per request):
+   - asks Square for order IDs only (return_entries) and counts them by scanning
+     the response text, never parsing whole orders;
+   - counts each Square location separately, so a cafe's cached counts are reused
+     by the "Both cafes" view;
+   - shares one page budget per request (budget.left); when it runs out the
+     position is saved in KV and the next load carries on from there;
+   - settled past periods are cached for 30 days. */
+function budgetError() { const e = new Error('budget'); e.status = 429; e.budget = true; return e; }
+async function posCountOne(env, locId, q, budget) {
+  const hours = +q.rollover || 0;
+  const key = 'poscnt1:' + [q.from, q.to, q.tz, hours, locId].join('|');
+  const cached = await env.TOKENS.get(key);
+  if (cached !== null && cached !== undefined) { const n = parseInt(cached, 10); if (!isNaN(n)) return n; }
+  const body = {
+    location_ids: [locId], limit: 1000, return_entries: true,
+    query: { filter: { state_filter: { states: ['COMPLETED'] },
+                       date_time_filter: { closed_at: { start_at: zonedToUtcIso(q.from, q.tz, hours),
+                                                        end_at: zonedToUtcIso(addDaysStr(q.to, 1), q.tz, hours) } } },
+             sort: { sort_field: 'CLOSED_AT', sort_order: 'ASC' } }
+  };
+  let count = 0, cursor = null;
+  const progKey = 'posprog:' + key.slice(8);
+  const prog = await env.TOKENS.get(progKey);
+  if (prog) { try { const p = JSON.parse(prog); count = p.count || 0; cursor = p.cursor || null; } catch (e) {} }
+  let first = true;
+  while (first || cursor) {
+    first = false;
+    if (budget.left <= 0) {
+      try { await env.TOKENS.put(progKey, JSON.stringify({ count: count, cursor: cursor }), { expirationTtl: 3600 }); } catch (e) {}
+      throw budgetError();
+    }
+    budget.left--;
+    const res = await fetch(SQUARE_BASE + '/v2/orders/search', {
+      method: 'POST', headers: posHeaders(env), body: JSON.stringify(cursor ? Object.assign({}, body, { cursor: cursor }) : body)
+    });
+    if (!res.ok) {
+      if (cursor && res.status === 400) { /* saved position expired: start this range again next load */
+        try { await env.TOKENS.delete(progKey); } catch (e) {}
+        throw budgetError();
+      }
+      const e = new Error('HTTP ' + res.status); e.status = res.status; throw e;
+    }
+    const text = await res.text();
+    let i = 0;
+    while ((i = text.indexOf('"order_id"', i)) !== -1) { count++; i += 10; }
+    const c = /"cursor"\s*:\s*"([^"]+)"/.exec(text.slice(Math.max(0, text.lastIndexOf('"cursor"') - 1)));
+    cursor = (text.lastIndexOf('"cursor"') !== -1 && c) ? c[1] : null;
+  }
+  try { await env.TOKENS.delete(progKey); } catch (e) {}
+  const today = new Date().toISOString().slice(0, 10);
+  const settled = q.to < addDaysStr(today, -3); /* allow a few days for offline-mode sales to arrive */
+  try { await env.TOKENS.put(key, String(count), { expirationTtl: settled ? 30 * 86400 : 300 }); } catch (e) {}
+  return count;
+}
 async function posCount(env, h, q, budget) {
   const info = await posInfo(env, h);
   if (!info.locations.length) { const e = new Error('no locations'); e.status = 403; throw e; }
   const locs = posLocationsFor(info, q.loc);
-  const hours = +q.rollover || 0;
-  const startAt = zonedToUtcIso(q.from, q.tz, hours);
-  const endAt = zonedToUtcIso(addDaysStr(q.to, 1), q.tz, hours);
-  const cacheKey = 'poscount:' + [q.from, q.to, q.tz, hours, locs.map(function (l) { return l.id; }).join('+')].join('|');
-  const today = new Date().toISOString().slice(0, 10);
-  const cached = await env.TOKENS.get(cacheKey);
-  if (cached !== null && cached !== undefined) { const n = parseInt(cached, 10); if (!isNaN(n)) return n; }
-  const body = {
-    location_ids: locs.map(function (l) { return l.id; }), limit: 1000,
-    query: { filter: { state_filter: { states: ['COMPLETED'] },
-                       date_time_filter: { closed_at: { start_at: startAt, end_at: endAt } } },
-             sort: { sort_field: 'CLOSED_AT', sort_order: 'ASC' } }
-  };
-  let count = 0, cursor = null, pages = 0;
-  do {
-    if (budget && budget.left-- <= 0) { const e = new Error('budget'); e.status = 429; throw e; }
-    const res = await h.fetchJson(SQUARE_BASE + '/v2/orders/search', {
-      method: 'POST', headers: posHeaders(env), body: JSON.stringify(cursor ? Object.assign({}, body, { cursor: cursor }) : body)
-    });
-    (res.orders || []).forEach(function (o) {
-      if (o.state === 'COMPLETED' && Array.isArray(o.line_items) && o.line_items.length > 0) count++;
-    });
-    cursor = res.cursor || null; pages++;
-  } while (cursor && pages < 60);
-  /* Past periods are settled (allow a day for offline-mode sales to arrive); today's range is not cached here. */
-  const settled = q.to < addDaysStr(today, -3);
-  try { await env.TOKENS.put(cacheKey, String(count), { expirationTtl: settled ? 86400 : 300 }); } catch (e) {}
-  return count;
+  let total = 0;
+  for (let i = 0; i < locs.length; i++) total += await posCountOne(env, locs[i].id, q, budget);
+  return total;
 }
 
 const ADAPTERS = {
@@ -374,17 +404,17 @@ const ADAPTERS = {
       return { connected: true, org: (info.name ? info.name + ' - ' : '') + names, sandbox: false };
     },
     async fetchRange(env, h, q) {
-      const n = await posCount(env, h, { from: q.from, to: q.to, tz: q.tz, rollover: q.rollover, loc: q.loc }, { left: 40 });
+      const n = await posCount(env, h, { from: q.from, to: q.to, tz: q.tz, rollover: q.rollover, loc: q.loc }, q.posBudget || { left: 30 });
       return { count: n };
     },
     async fetchMonthly(env, h, q) {
       const months = monthList(q.fromMonth, q.toMonth);
       const out = { months: months, count: months.map(function () { return null; }) };
-      const budget = { left: 40 };
+      const budget = q.posBudget || { left: 30 };
       for (let i = months.length - 1; i >= 0; i--) { /* newest first, so recent months fill first */
         try {
           out.count[i] = await posCount(env, h, { from: months[i] + '-01', to: xeroLastDay(months[i]), tz: q.tz, rollover: q.rollover, loc: q.loc }, budget);
-        } catch (e) { if (e && e.message === 'budget') break; throw e; }
+        } catch (e) { if (e && e.budget) { if (q.posBudget) q.posBudget.pending = true; break; } throw e; }
       }
       return out;
     }
@@ -909,6 +939,7 @@ async function fetchSlot(env, q) {
       try { await env.TOKENS.delete('diag:' + source); } catch (e) {}
     } catch (err) {
       out[source] = null; /* per-source failure never breaks the whole payload */
+      if (err && err.budget) { if (q.posBudget) q.posBudget.pending = true; continue; } /* still counting: not an error */
       try {
         await env.TOKENS.put('diag:' + source, JSON.stringify({ at: Date.now(), code: err.status || 0, msg: String((err && err.message) || '').slice(0, 300) }), { expirationTtl: 3600 });
       } catch (e) {}
@@ -929,7 +960,10 @@ async function apiMetrics(env, url) {
   const rollover = Math.max(0, Math.min(6, parseInt(url.searchParams.get('rollover') || '0', 10) || 0));
 
   const location = findLocation(url.searchParams.get('loc') || '');
-  const base = { tz, rollover, loc: location ? location.key : null };
+  /* Square pages this request may fetch: keeps the whole request under the free
+     plan's 50-subrequest cap (Xero uses ~8). Unfinished counts resume next load. */
+  const posBudget = { left: Math.max(1, parseInt(env.POS_PAGE_BUDGET || '30', 10) || 30), pending: false };
+  const base = { tz, rollover, loc: location ? location.key : null, posBudget: posBudget };
   const [sAcc, sPos, sRos] = await Promise.all([
     sourceStatus(env, 'accounting'),
     sourceStatus(env, 'pos'),
@@ -971,8 +1005,8 @@ async function apiMetrics(env, url) {
         } catch (err) { trendOut[source] = null; }
       }
     }
-    data = { generatedAt: new Date().toISOString(), periods: periods, trend: trendOut };
-    if (env.TOKENS) {
+    data = { generatedAt: new Date().toISOString(), periods: periods, trend: trendOut, posPending: posBudget.pending };
+    if (env.TOKENS && !posBudget.pending) {
       try { await env.TOKENS.put(cacheKey, JSON.stringify(data), { expirationTtl: METRICS_CACHE_TTL }); } catch (e) {}
     }
   }
@@ -983,6 +1017,7 @@ async function apiMetrics(env, url) {
     sources: { accounting: sAcc, pos: sPos, rostering: sRos },
     locations: LOCATIONS.map(function (l) { return { key: l.key, name: l.name }; }),
     location: base.loc || 'all',
+    posPending: !!data.posPending,
     locationIssues: location ? await locationIssues(env, location, sAcc, sPos) : [],
     periods: data.periods,
     trend: data.trend

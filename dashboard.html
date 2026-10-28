@@ -582,6 +582,11 @@ function fetchData(force) {
   }).then(function (json) {
     state.data = json; state.fetchedAt = json.generatedAt ? new Date(json.generatedAt) : new Date(); state.loading = false;
     render();
+    /* Square counts big ranges a slice per load; keep loading until they're all in */
+    if (json.posPending && (state.pendingTries = (state.pendingTries || 0) + 1) <= 60) {
+      clearTimeout(state.pendingTimer);
+      state.pendingTimer = setTimeout(function () { fetchData(); }, 2500);
+    } else if (!json.posPending) { state.pendingTries = 0; }
   }).catch(function (err) {
     state.loading = false;
     state.fetchError = 'The dashboard couldn’t fetch data just now. Check the Connections screen, or try refresh.';
@@ -849,6 +854,11 @@ function renderDashboard(root) {
       lbar.appendChild(lc);
     });
     root.appendChild(lbar);
+    if (state.data && state.data.posPending) {
+      var pb = el('div', 'banner banner-amber');
+      pb.innerHTML = '<span class="spin"></span> <b>Still counting ' + esc(P.pos) + ' transactions.</b> Big date ranges come in a slice at a time; this fills in by itself in a minute or so. Past months are remembered after that.';
+      root.appendChild(pb);
+    }
     var issues = (state.data && state.data.locationIssues) || [];
     if (issues.length) {
       var lb = el('div', 'banner banner-amber');
