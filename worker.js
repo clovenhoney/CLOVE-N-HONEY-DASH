@@ -796,6 +796,11 @@ async function sourceStatus(env, source) {
   try {
     const h = makeHelpers(env, source);
     const st = await adapter.status(env, h);
+    let recent = null;
+    try {
+      const d = await env.TOKENS.get('diag:' + source);
+      if (d) { const j = JSON.parse(d); if (j && Date.now() - j.at < 3600000) recent = j; }
+    } catch (e) {}
     return {
       configured: true,
       ingest: typeof adapter.parseExport === 'function',
@@ -803,7 +808,7 @@ async function sourceStatus(env, source) {
       org: (st && st.org) || null,
       sandbox: !!(st && st.sandbox),
       lastSync: (st && st.lastSync) || (await lastSync(env, source)) || null,
-      error: null
+      error: recent ? { code: recent.code, plain: plainError(recent.code || 500) + ' [' + (recent.code || '') + ' ' + recent.msg + ']' } : null
     };
   } catch (err) {
     return {
@@ -828,8 +833,12 @@ async function fetchSlot(env, q) {
       const h = makeHelpers(env, source);
       out[source] = await adapter.fetchRange(env, h, q);
       await noteSync(env, source);
+      try { await env.TOKENS.delete('diag:' + source); } catch (e) {}
     } catch (err) {
       out[source] = null; /* per-source failure never breaks the whole payload */
+      try {
+        await env.TOKENS.put('diag:' + source, JSON.stringify({ at: Date.now(), code: err.status || 0, msg: String((err && err.message) || '').slice(0, 120) }), { expirationTtl: 3600 });
+      } catch (e) {}
     }
   }
   return out;
