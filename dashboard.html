@@ -1251,7 +1251,11 @@ function renderConnections(root) {
     }
 
     var act = el('div', 'conn-actions');
-    if (st.configured) {
+    if (st.configured && st.auth === 'token') {
+      act.appendChild(el('span', 'conn-line', st.connected
+        ? 'Connected with the access token saved in Cloudflare. To change it, update that secret in Cloudflare.'
+        : 'Connects with an access token saved in Cloudflare (Settings → Variables and Secrets). Your AI walks you through it.'));
+    } else if (st.configured) {
       var rec = el('button', 'btn-plain', st.connected ? 'Reconnect' : 'Connect');
       rec.onclick = function () { window.location.href = '/auth/' + s.key + '/start'; };
       act.appendChild(rec);
@@ -1260,9 +1264,11 @@ function renderConnections(root) {
     }
     card.appendChild(act);
 
-    var cb = el('div', 'cb-url');
-    cb.innerHTML = 'Callback address for this connection (your AI may ask for it): <b>' + esc(location.origin + '/auth/' + s.key + '/callback') + '</b>';
-    card.appendChild(cb);
+    if (st.auth !== 'token') {
+      var cb = el('div', 'cb-url');
+      cb.innerHTML = 'Callback address for this connection (your AI may ask for it): <b>' + esc(location.origin + '/auth/' + s.key + '/callback') + '</b>';
+      card.appendChild(cb);
+    }
 
     if (st.ingest) card.appendChild(uploadPanel(s));
 

@@ -871,6 +871,7 @@ async function sourceStatus(env, source) {
     } catch (e) {}
     return {
       configured: true,
+      auth: adapter.auth || null,
       ingest: typeof adapter.parseExport === 'function',
       connected: !!(st && st.connected),
       org: (st && st.org) || null,
@@ -881,6 +882,7 @@ async function sourceStatus(env, source) {
   } catch (err) {
     return {
       configured: true,
+      auth: adapter.auth || null,
       ingest: typeof adapter.parseExport === 'function',
       connected: false,
       org: null,
