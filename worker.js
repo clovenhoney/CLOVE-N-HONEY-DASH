@@ -127,7 +127,8 @@ async function xeroTenant(env, h) {
    Each location is matched by name: Xero tracking option name and Square location
    name must contain the match text. key is what the page sends as ?loc=. */
 const LOCATIONS = [
-  { key: 'stones-corner', name: 'Stones Corner', match: /stones/i },
+  /* In Square the Stones Corner location is named just "CLOVE N HONEY" (owner confirmed) */
+  { key: 'stones-corner', name: 'Stones Corner', match: /stones/i, square: /stones|^\s*clove\s*(n|and|&)\s*honey\s*$/i },
   { key: 'ormeau', name: 'Ormeau', match: /ormeau/i }
 ];
 function findLocation(key) {
@@ -230,7 +231,8 @@ async function posInfo(env, h) {
 function posLocationsFor(info, locKey) {
   const loc = locKey ? findLocation(locKey) : null;
   if (!loc) return info.locations;
-  const locs = info.locations.filter(function (l) { return loc.match.test(l.name || ''); });
+  const re = loc.square || loc.match;
+  const locs = info.locations.filter(function (l) { return re.test(l.name || ''); });
   if (!locs.length) throw locationError('Square has no location with "' + loc.name + '" in its name. Your Square locations are: '
     + (info.locations.map(function (l) { return l.name; }).join(', ') || 'none') + '.');
   return locs;
@@ -877,7 +879,8 @@ async function sourceStatus(env, source) {
       org: (st && st.org) || null,
       sandbox: !!(st && st.sandbox),
       lastSync: (st && st.lastSync) || (await lastSync(env, source)) || null,
-      error: recent ? { code: recent.code, plain: plainError(recent.code || 500) + ' [' + (recent.code || '') + ' ' + recent.msg + ']' } : null
+      error: recent ? { code: recent.code, plain: (/^location: /.test(recent.msg || '') ? recent.msg.slice(10)
+        : plainError(recent.code || 500) + ' [' + (recent.code || '') + ' ' + recent.msg + ']') } : null
     };
   } catch (err) {
     return {
@@ -907,7 +910,7 @@ async function fetchSlot(env, q) {
     } catch (err) {
       out[source] = null; /* per-source failure never breaks the whole payload */
       try {
-        await env.TOKENS.put('diag:' + source, JSON.stringify({ at: Date.now(), code: err.status || 0, msg: String((err && err.message) || '').slice(0, 120) }), { expirationTtl: 3600 });
+        await env.TOKENS.put('diag:' + source, JSON.stringify({ at: Date.now(), code: err.status || 0, msg: String((err && err.message) || '').slice(0, 300) }), { expirationTtl: 3600 });
       } catch (e) {}
     }
   }
