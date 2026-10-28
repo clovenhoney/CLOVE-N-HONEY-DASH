@@ -68,10 +68,16 @@ function xeroSectionKind(title) {
   if (/income|revenue|sales|trading/.test(t)) return 'income';
   return null;
 }
+const XERO_MONTHS = { jan: 1, feb: 2, mar: 3, apr: 4, may: 5, jun: 6, jul: 7, aug: 8, sep: 9, oct: 10, nov: 11, dec: 12 };
+/* Column header -> 'YYYY-MM'. Reads the month name and year as written ('Oct 2026',
+   'Oct-26', '31 Oct 26'), so it never depends on the runtime's timezone. */
 function xeroMonthKey(label) {
-  const ms = Date.parse(String(label || ''));
-  if (isNaN(ms)) return null;
-  return new Date(ms).toISOString().slice(0, 7);
+  const m = /([A-Za-z]{3})[A-Za-z]*\.?[\s\-]+(\d{4}|\d{2})\b/.exec(String(label || ''));
+  if (m && XERO_MONTHS[m[1].toLowerCase()]) {
+    const y = m[2].length === 2 ? 2000 + +m[2] : +m[2];
+    return y + '-' + String(XERO_MONTHS[m[1].toLowerCase()]).padStart(2, '0');
+  }
+  return null;
 }
 /* Parse a Xero P&L report JSON into one column object per period. */
 function xeroParsePnl(rep) {
@@ -117,6 +123,54 @@ async function xeroTenant(env, h) {
   await env.TOKENS.put('xerotenant', JSON.stringify(c));
   return c;
 }
+/* ---------------- Locations (Clove n Honey: two cafes, shown separately) ----------------
+   Each location is matched by name: Xero tracking option name and Square location
+   name must contain the match text. key is what the page sends as ?loc=. */
+const LOCATIONS = [
+  { key: 'stones-corner', name: 'Stones Corner', match: /stones/i },
+  { key: 'ormeau', name: 'Ormeau', match: /ormeau/i }
+];
+function findLocation(key) {
+  for (let i = 0; i < LOCATIONS.length; i++) if (LOCATIONS[i].key === key) return LOCATIONS[i];
+  return null;
+}
+function locationError(plain) { const e = new Error('location: ' + plain); e.plain = plain; e.status = 0; return e; }
+
+/* Active Xero tracking categories with their options (cached an hour per connection). */
+async function xeroTracking(env, h) {
+  const org = await xeroTenant(env, h);
+  const key = 'xerotracking:' + org.id + ':' + org.stamp;
+  const raw = await env.TOKENS.get(key);
+  if (raw) { try { return JSON.parse(raw); } catch (e) {} }
+  const res = await h.fetchJson('https://api.xero.com/api.xro/2.0/TrackingCategories', {
+    headers: { 'Xero-Tenant-Id': org.id, 'Accept': 'application/json' }
+  });
+  const cats = (res.TrackingCategories || [])
+    .filter(function (c) { return !c.Status || c.Status === 'ACTIVE'; })
+    .map(function (c) {
+      return { id: c.TrackingCategoryID, name: c.Name || '',
+               options: (c.Options || []).filter(function (o) { return !o.Status || o.Status === 'ACTIVE'; })
+                 .map(function (o) { return { id: o.TrackingOptionID, name: o.Name || '' }; }) };
+    });
+  try { await env.TOKENS.put(key, JSON.stringify(cats), { expirationTtl: 3600 }); } catch (e) {}
+  return cats;
+}
+/* P&L filter params for one location: the tracking category whose options cover
+   the most locations (ties go to one named like 'Location'), then its matching option. */
+async function xeroLocationParams(env, h, loc) {
+  const cats = await xeroTracking(env, h);
+  let best = null, bestScore = 0;
+  cats.forEach(function (c) {
+    let score = LOCATIONS.filter(function (l) { return c.options.some(function (o) { return l.match.test(o.name); }); }).length * 2;
+    if (score && /location|site|venue|store|branch|shop|cafe/i.test(c.name)) score += 1;
+    if (score > bestScore) { best = c; bestScore = score; }
+  });
+  if (!best) throw locationError('Xero has no tracking category with options named ' + LOCATIONS.map(function (l) { return l.name; }).join(' / ') + '. Check Settings > Tracking categories in Xero.');
+  const opt = best.options.find(function (o) { return loc.match.test(o.name); });
+  if (!opt) throw locationError('Xero tracking category "' + best.name + '" has no option for ' + loc.name + '.');
+  return { trackingCategoryID: best.id, trackingOptionID: opt.id };
+}
+
 async function xeroPnl(h, tenantId, params) {
   const p = new URLSearchParams(Object.assign({ standardLayout: 'true', paymentsOnly: 'false' }, params));
   return h.fetchJson('https://api.xero.com/api.xro/2.0/Reports/ProfitAndLoss?' + p.toString(), {
@@ -172,19 +226,29 @@ async function posInfo(env, h) {
   await env.TOKENS.put(key, JSON.stringify(info), { expirationTtl: 3600 });
   return info;
 }
+/* Square locations for one venue location key (all active ones when no key). */
+function posLocationsFor(info, locKey) {
+  const loc = locKey ? findLocation(locKey) : null;
+  if (!loc) return info.locations;
+  const locs = info.locations.filter(function (l) { return loc.match.test(l.name || ''); });
+  if (!locs.length) throw locationError('Square has no location with "' + loc.name + '" in its name. Your Square locations are: '
+    + (info.locations.map(function (l) { return l.name; }).join(', ') || 'none') + '.');
+  return locs;
+}
 /* Count completed sales (not voids/cancels; refund-only orders are not sales) in a local date range. */
 async function posCount(env, h, q, budget) {
   const info = await posInfo(env, h);
   if (!info.locations.length) { const e = new Error('no locations'); e.status = 403; throw e; }
+  const locs = posLocationsFor(info, q.loc);
   const hours = +q.rollover || 0;
   const startAt = zonedToUtcIso(q.from, q.tz, hours);
   const endAt = zonedToUtcIso(addDaysStr(q.to, 1), q.tz, hours);
-  const cacheKey = 'poscount:' + [q.from, q.to, q.tz, hours, info.locations.map(function (l) { return l.id; }).join('+')].join('|');
+  const cacheKey = 'poscount:' + [q.from, q.to, q.tz, hours, locs.map(function (l) { return l.id; }).join('+')].join('|');
   const today = new Date().toISOString().slice(0, 10);
   const cached = await env.TOKENS.get(cacheKey);
   if (cached !== null && cached !== undefined) { const n = parseInt(cached, 10); if (!isNaN(n)) return n; }
   const body = {
-    location_ids: info.locations.map(function (l) { return l.id; }), limit: 1000,
+    location_ids: locs.map(function (l) { return l.id; }), limit: 1000,
     query: { filter: { state_filter: { states: ['COMPLETED'] },
                        date_time_filter: { closed_at: { start_at: startAt, end_at: endAt } } },
              sort: { sort_field: 'CLOSED_AT', sort_order: 'ASC' } }
@@ -234,7 +298,7 @@ const ADAPTERS = {
     oauth: {
       authorizeUrl: 'https://login.xero.com/identity/connect/authorize',
       tokenUrl: 'https://identity.xero.com/connect/token',
-      scopes: 'offline_access accounting.reports.profitandloss.read',
+      scopes: 'offline_access accounting.reports.profitandloss.read accounting.settings.read', /* settings.read: tracking categories, for the per-location split */
       clientIdSecret: 'ACCOUNTING_CLIENT_ID',
       clientSecretSecret: 'ACCOUNTING_CLIENT_SECRET',
       tokenAuth: 'basic'
@@ -247,7 +311,9 @@ const ADAPTERS = {
     },
     async fetchRange(env, h, q) {
       const org = await xeroTenant(env, h);
-      const rep = await xeroPnl(h, org.id, { fromDate: q.from, toDate: q.to });
+      const loc = q.loc ? findLocation(q.loc) : null;
+      const track = loc ? await xeroLocationParams(env, h, loc) : {};
+      const rep = await xeroPnl(h, org.id, Object.assign({ fromDate: q.from, toDate: q.to }, track));
       const p = xeroParsePnl(rep);
       const c = p.cols[0] || { revenue: 0, cogs: 0, wagesSuper: 0, overheads: 0 };
       return {
@@ -257,6 +323,8 @@ const ADAPTERS = {
     },
     async fetchMonthly(env, h, q) {
       const org = await xeroTenant(env, h);
+      const loc = q.loc ? findLocation(q.loc) : null;
+      const track = loc ? await xeroLocationParams(env, h, loc) : {};
       const months = monthList(q.fromMonth, q.toMonth);
       const out = { months: months, revenue: [], cogs: [], wagesSuper: [], overheads: [] };
       const idx = {}; months.forEach(function (m, i) {
@@ -264,10 +332,10 @@ const ADAPTERS = {
       });
       for (let i = 0; i < months.length; i += 12) {
         const chunk = months.slice(i, i + 12);
-        const rep = await xeroPnl(h, org.id, {
-          fromDate: chunk[0] + '-01', toDate: xeroLastDay(chunk[chunk.length - 1]),
-          periods: String(chunk.length - 1), timeframe: 'MONTH'
-        });
+        /* Xero's periods param counts comparison periods (1-11 here); a single-month chunk sends none */
+        const params = { fromDate: chunk[chunk.length - 1] + '-01', toDate: xeroLastDay(chunk[chunk.length - 1]) };
+        if (chunk.length > 1) { params.periods = String(chunk.length - 1); params.timeframe = 'MONTH'; }
+        const rep = await xeroPnl(h, org.id, Object.assign(params, track));
         const p = xeroParsePnl(rep);
         p.cols.forEach(function (c, k) {
           const key = c.month || chunk[chunk.length - 1 - k]; /* Xero lists the latest period first */
@@ -304,7 +372,7 @@ const ADAPTERS = {
       return { connected: true, org: (info.name ? info.name + ' - ' : '') + names, sandbox: false };
     },
     async fetchRange(env, h, q) {
-      const n = await posCount(env, h, { from: q.from, to: q.to, tz: q.tz, rollover: q.rollover }, { left: 40 });
+      const n = await posCount(env, h, { from: q.from, to: q.to, tz: q.tz, rollover: q.rollover, loc: q.loc }, { left: 40 });
       return { count: n };
     },
     async fetchMonthly(env, h, q) {
@@ -313,7 +381,7 @@ const ADAPTERS = {
       const budget = { left: 40 };
       for (let i = months.length - 1; i >= 0; i--) { /* newest first, so recent months fill first */
         try {
-          out.count[i] = await posCount(env, h, { from: months[i] + '-01', to: xeroLastDay(months[i]), tz: q.tz, rollover: q.rollover }, budget);
+          out.count[i] = await posCount(env, h, { from: months[i] + '-01', to: xeroLastDay(months[i]), tz: q.tz, rollover: q.rollover, loc: q.loc }, budget);
         } catch (e) { if (e && e.message === 'budget') break; throw e; }
       }
       return out;
@@ -855,7 +923,8 @@ async function apiMetrics(env, url) {
   const tz = url.searchParams.get('tz') || 'Australia/Sydney';
   const rollover = Math.max(0, Math.min(6, parseInt(url.searchParams.get('rollover') || '0', 10) || 0));
 
-  const base = { tz, rollover };
+  const location = findLocation(url.searchParams.get('loc') || '');
+  const base = { tz, rollover, loc: location ? location.key : null };
   const [sAcc, sPos, sRos] = await Promise.all([
     sourceStatus(env, 'accounting'),
     sourceStatus(env, 'pos'),
@@ -870,7 +939,7 @@ async function apiMetrics(env, url) {
   const cacheKey = 'metricscache:' + [
     url.searchParams.get('cur') || '', url.searchParams.get('prev') || '',
     url.searchParams.get('yoy') || '', url.searchParams.get('trend') || '',
-    tz, rollover
+    tz, rollover, base.loc || 'all'
   ].join('|');
   const force = url.searchParams.get('refresh') === '1';
   let data = null;
@@ -907,9 +976,31 @@ async function apiMetrics(env, url) {
     generatedAt: data.generatedAt,
     protected: true,
     sources: { accounting: sAcc, pos: sPos, rostering: sRos },
+    locations: LOCATIONS.map(function (l) { return { key: l.key, name: l.name }; }),
+    location: base.loc || 'all',
+    locationIssues: location ? await locationIssues(env, location, sAcc, sPos) : [],
     periods: data.periods,
     trend: data.trend
   });
+}
+
+/* Plain-English reasons a location's figures can't be split out (e.g. no matching
+   Xero tracking option or Square location name). Connection problems are already
+   reported per source, so only location-matching problems are listed here. */
+async function locationIssues(env, loc, sAcc, sPos) {
+  const out = [];
+  if (ADAPTERS.accounting.configured && sAcc && sAcc.connected) {
+    try { await xeroLocationParams(env, makeHelpers(env, 'accounting'), loc); }
+    catch (e) {
+      if (e && e.plain) out.push(e.plain);
+      else if (e && (e.status === 401 || e.status === 403)) out.push('Xero needs one more read-only permission to split figures by location. Open Connections and click Reconnect on Xero.');
+    }
+  }
+  if (ADAPTERS.pos.configured && sPos && sPos.connected) {
+    try { posLocationsFor(await posInfo(env, makeHelpers(env, 'pos')), loc.key); }
+    catch (e) { if (e && e.plain) out.push(e.plain); }
+  }
+  return out;
 }
 
 function monthList(fromMonth, toMonth) {

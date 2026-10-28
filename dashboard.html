@@ -91,6 +91,7 @@ body {
 
 /* Period bar */
 .period-bar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 0.4rem; }
+.loc-bar { margin-bottom: 0.7rem; }
 .period-label { font-family: 'Khand', sans-serif; font-size: 12px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.1em; color: var(--muted); margin-right: 2px; }
 .pchip {
   font-size: 13px; font-weight: 400; padding: 8px 15px; border-radius: 50px;
@@ -279,6 +280,10 @@ var KIT_CONFIG = {
     "overheads",
     "profit"
   ],
+  "locations": [
+    { "key": "stones-corner", "name": "Stones Corner" },
+    { "key": "ormeau", "name": "Ormeau" }
+  ],
   "startLevel": "live",
   "kitDate": "October 2026",
   "feedbackUrl": ""
@@ -288,7 +293,7 @@ var KIT_CONFIG = {
 /* ============================================================
    Settings (owner-editable in the Settings screen, never in code)
 ============================================================ */
-var TZ_DEFAULTS = { AU: 'Australia/Sydney', NZ: 'Pacific/Auckland', US: 'America/New_York' };
+var TZ_DEFAULTS = { AU: 'Australia/Brisbane', NZ: 'Pacific/Auckland', US: 'America/New_York' };
 var TZ_CHOICES = {
   AU: ['Australia/Sydney','Australia/Melbourne','Australia/Brisbane','Australia/Adelaide','Australia/Perth','Australia/Hobart','Australia/Darwin'],
   NZ: ['Pacific/Auckland','Pacific/Chatham'],
@@ -479,8 +484,22 @@ function fmtRange(r) {
 /* ============================================================
    App state + data fetch
 ============================================================ */
+function locList() { return KIT_CONFIG.locations || []; }
+function loadLoc() {
+  var saved = null;
+  try { saved = localStorage.getItem('vd_loc'); } catch (e) {}
+  var ok = saved === 'all' || locList().some(function (l) { return l.key === saved; });
+  return ok ? saved : (locList()[0] ? locList()[0].key : 'all');
+}
+function saveLoc() { try { localStorage.setItem('vd_loc', state.loc); } catch (e) {} }
+function locName(key) {
+  if (key === 'all') return 'Both cafes';
+  var l = locList().filter(function (x) { return x.key === key; })[0];
+  return l ? l.name : 'Both cafes';
+}
 var state = {
   view: 'dashboard',           /* dashboard | connections | recon | settings */
+  loc: loadLoc(),              /* location key, or 'all' for both cafes combined */
   period: SETTINGS.defaultPeriod === 'custom' ? 'thisWeek' : SETTINGS.defaultPeriod,
   customFrom: null, customTo: null,
   loading: false,
@@ -498,7 +517,8 @@ function apiUrl(force) {
         + (r.yoy ? '&yoy=' + iso(r.yoy.from) + ':' + iso(r.yoy.to) : '')
         + '&trend=' + monthKey(trendStart) + ':' + monthKey(trendEnd)
         + '&tz=' + encodeURIComponent(SETTINGS.timezone)
-        + '&rollover=' + (+SETTINGS.rolloverHour || 0);
+        + '&rollover=' + (+SETTINGS.rolloverHour || 0)
+        + (state.loc && state.loc !== 'all' ? '&loc=' + encodeURIComponent(state.loc) : '');
   return '/api/metrics?' + q + (force ? '&refresh=1' : '');
 }
 
@@ -815,6 +835,27 @@ function esc(s) {
 /* ---------- Dashboard view ---------- */
 function renderDashboard(root) {
   var r = resolvePeriod(state.period, state.customFrom, state.customTo);
+
+  /* Location selector (each cafe on its own, or both combined) */
+  if (!isManual() && locList().length > 1) {
+    var lbar = el('div', 'period-bar loc-bar');
+    lbar.appendChild(el('span', 'period-label', 'Cafe'));
+    locList().concat([{ key: 'all', name: 'Both cafes' }]).forEach(function (l) {
+      var lc = el('button', 'pchip' + (state.loc === l.key ? ' on' : ''), esc(l.name));
+      lc.onclick = function () {
+        if (state.loc === l.key) return;
+        state.loc = l.key; saveLoc(); state.data = null; fetchData();
+      };
+      lbar.appendChild(lc);
+    });
+    root.appendChild(lbar);
+    var issues = (state.data && state.data.locationIssues) || [];
+    if (issues.length) {
+      var lb = el('div', 'banner banner-amber');
+      lb.innerHTML = '<b>' + esc(locName(state.loc)) + ' can’t be split out yet.</b> ' + issues.map(esc).join(' ');
+      root.appendChild(lb);
+    }
+  }
 
   /* Period selector */
   var bar = el('div', 'period-bar');
@@ -1304,6 +1345,11 @@ function renderRecon(root) {
 
   var r = resolvePeriod(state.period, state.customFrom, state.customTo);
   root.appendChild(el('p', 'screen-sub', 'Checking period: <b>' + fmtRange(r) + '</b> (change it with the period buttons on the Dashboard).'));
+  if (!isManual() && locList().length > 1) {
+    root.appendChild(el('p', 'screen-sub', state.loc === 'all'
+      ? 'Checking: <b>both cafes combined</b>. Run the ' + esc(P.accounting) + ' profit and loss with no location filter.'
+      : 'Checking: <b>' + esc(locName(state.loc)) + '</b> only. In ' + esc(P.accounting) + ', filter the profit and loss by your location tracking category; in ' + esc(P.pos) + ', pick just this location.'));
+  }
 
   var cur = periodValues('cur');
   var anyReady = false;
