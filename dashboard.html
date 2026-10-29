@@ -617,6 +617,7 @@ function periodValues(slot) {  /* slot: 'cur' | 'prev' | 'yoy' */
     out.cogs = num(acc.cogs);
     out.wagesSuper = num(acc.wagesSuper);
     out.overheads = num(acc.overheads);
+    if (acc.breakEven) out.be = { sales: num(acc.breakEven.sales), variable: num(acc.breakEven.variable), fixed: num(acc.breakEven.fixed) };
   }
   if (pos) out.count = num(pos.count);
   if (ros) out.rosteredCost = num(ros.cost);
@@ -936,7 +937,144 @@ function renderDashboard(root) {
   var grid = el('div', 'cards');
   var cur = periodValues('cur'), prev = periodValues('prev'), yoy = periodValues('yoy');
   CHOSEN.forEach(function (k) { grid.appendChild(metricCard(k, cur, prev, yoy, r)); });
+  if (!isManual()) grid.appendChild(breakEvenCard(cur, prev, r));
   root.appendChild(grid);
+}
+
+/* ---------- Break-even tile ----------
+   Sales needed to cover every cost in the period: fixed costs ÷ (1 − variable
+   costs as a share of sales). Inputs come from the worker's accounting adapter
+   (breakEven: sales, variable, fixed), which leaves out landlord incentives,
+   Div 7A interest, income tax, dividends and asset write-offs. Shown per week
+   and per trading day (both cafes trade 7 days). */
+function breakEvenCalc(be) {
+  if (!be || be.sales == null || be.variable == null || be.fixed == null || !(be.sales > 0)) return null;
+  var varShare = be.variable / be.sales;
+  if (!(varShare < 1)) return { varShare: varShare, point: null };
+  return { varShare: varShare, point: be.fixed / (1 - varShare) };
+}
+function breakEvenCard(cur, prev, r) {
+  var card = el('div', 'mcard fade-in');
+  var days = Math.round((r.to.getTime() - r.from.getTime()) / 86400000) + 1;
+  var weeks = days / 7;
+  card.appendChild(el('span', 'm-tag tag-proj', 'Estimate'));
+  card.appendChild(el('div', 'm-label', 'Break-even'));
+  if (!isConfigured('accounting')) {
+    card.className += ' not-conf';
+    card.appendChild(el('div', 'm-value dim', 'Not configured'));
+    card.appendChild(el('div', 'notconf-msg', esc(P.accounting) + ' isn’t connected yet. This card lights up when it is.'));
+    return card;
+  }
+  if (state.loading && state.data == null) { card.appendChild(el('div', 'm-value dim', '…')); return card; }
+  var be = cur.be, calc = breakEvenCalc(be);
+  if (!calc) {
+    card.appendChild(el('div', 'm-value dim', '—'));
+    card.appendChild(el('div', 'notconf-msg', 'No sales or cost figures for this period yet.'));
+  } else if (calc.point == null) {
+    card.appendChild(el('div', 'm-value dim', '—'));
+    card.appendChild(el('div', 'notconf-msg', 'Food and other variable costs came to ' + (calc.varShare * 100).toFixed(1) + '% of sales this period, so no amount of sales covers the fixed costs. Check cost of sales for this period.'));
+  } else {
+    var perWeek = calc.point / weeks, perDay = calc.point / days;
+    var salesWeek = be.sales / weeks, gapWeek = salesWeek - perWeek;
+    var above = gapWeek >= 0;
+    if (!above) card.className += ' alert';
+    var wrap = el('div', 'm-figs');
+    var f1 = el('div', 'm-fig');
+    f1.appendChild(el('div', 'm-pri', fmtMoney(perWeek, false)));
+    f1.appendChild(el('div', 'm-unit', 'sales a week'));
+    wrap.appendChild(f1);
+    var f2 = el('div', 'm-fig sec');
+    f2.appendChild(el('div', 'm-pri', fmtMoney(perDay, false)));
+    f2.appendChild(el('div', 'm-unit', 'a day'));
+    wrap.appendChild(f2);
+    card.appendChild(wrap);
+
+    /* Meter: actual weekly sales against the break-even line */
+    var scale = Math.max(salesWeek, perWeek) * 1.25; if (!(scale > 0)) scale = 1;
+    var m = el('div', 'meter');
+    var track = el('div', 'meter-track');
+    var fl = el('div', 'meter-fill ' + (above ? 'good' : 'bad'));
+    fl.style.width = Math.max(0, Math.min(100, (salesWeek / scale) * 100)).toFixed(1) + '%';
+    var mk = el('div', 'meter-mark');
+    mk.style.left = Math.max(0, Math.min(100, (perWeek / scale) * 100)).toFixed(1) + '%';
+    track.appendChild(fl); track.appendChild(mk);
+    m.appendChild(track);
+    var cap = el('div', 'meter-cap');
+    cap.innerHTML = 'Actual <b>' + esc(fmtMoney(salesWeek, false)) + '</b> a week · <span class="' + (above ? 'good' : 'bad') + '">'
+      + esc(fmtMoney(Math.abs(gapWeek), false)) + (above ? ' above' : ' below') + ' break-even</span>';
+    m.appendChild(cap);
+    card.appendChild(m);
+
+    function row(lab, val) {
+      var rw = el('div', 'cmp-row');
+      rw.appendChild(el('span', 'cmp-lab', esc(lab)));
+      rw.appendChild(el('span', 'cmp-val flat', esc(val)));
+      card.appendChild(rw);
+    }
+    row('Break-even for this period', fmtMoney(calc.point, false));
+    row('Variable costs (food, fees)', (calc.varShare * 100).toFixed(1) + '% of sales');
+    row('Fixed costs (wages, rent, overheads)', fmtMoney(be.fixed, false));
+    var pc = breakEvenCalc(prev.be);
+    if (pc && pc.point != null) {
+      var pdays = Math.round((r.prev.to.getTime() - r.prev.from.getTime()) / 86400000) + 1;
+      var pw = pc.point / (pdays / 7);
+      var d = perWeek - pw, pct = pw ? (d / pw) * 100 : 0;
+      var rw = el('div', 'cmp-row');
+      rw.appendChild(el('span', 'cmp-lab', esc(r.prevLabel)));
+      rw.appendChild(cmpVal(Math.abs(pct) < 0.05 ? { dir: 'flat', text: '0.0%', good: null }
+        : { dir: d > 0 ? 'up' : 'down', text: Math.abs(pct).toFixed(1) + '%', good: d < 0 }));
+      card.appendChild(rw);
+    }
+    if (days < 28) card.appendChild(el('div', 'm-sub', 'Short periods swing with when rent and wage bills land in Xero. A month or longer reads best.'));
+  }
+  card.appendChild(breakEvenTrend(r));
+  card.appendChild(el('div', 'm-def', 'Sales needed to cover every cost: fixed costs ÷ (1 − variable costs as a share of sales). Variable: cost of sales (not Kitchen Tools), card and Square fees, packaging, EatClub, delivery. Leaves out landlord incentives, Div 7A interest, income tax, dividends and asset write-offs · from ' + P.accounting));
+  var dec = el('div', 'm-decision');
+  dec.appendChild(el('b', null, 'Drives: '));
+  dec.appendChild(document.createTextNode('How much trade each cafe needs before it makes a dollar. Lower it by cutting food cost or fixed costs; beat it with more weekday trade.'));
+  card.appendChild(dec);
+  return card;
+}
+/* 12 months of sales above (green) or below (coral) break-even, in dollars. */
+function breakEvenTrend(r) {
+  var wrap = el('div', 'tbars');
+  wrap.appendChild(el('div', 'tbars-cap', 'Sales above or below break-even · last 12 months · hover a bar'));
+  var d = state.data, acc = d && d.trend && d.trend.accounting;
+  if (!acc || !acc.beSales) { wrap.appendChild(el('div', 'notconf-msg', 'The trend fills in as monthly history comes in.')); return wrap; }
+  var months = d.trend.months, n = months.length, start = Math.max(0, n - 12);
+  var vals = [], labs = [];
+  for (var i = start; i < n; i++) {
+    var c = breakEvenCalc({ sales: acc.beSales[i], variable: acc.beVariable[i], fixed: acc.beFixed[i] });
+    vals.push(c && c.point != null ? acc.beSales[i] - c.point : null); labs.push(months[i]);
+  }
+  var shown = vals.filter(function (x) { return x != null; });
+  if (!shown.length) { wrap.appendChild(el('div', 'notconf-msg', 'The trend fills in as monthly history comes in.')); return wrap; }
+  var maxv = Math.max.apply(null, shown.concat([0])), minv = Math.min.apply(null, shown.concat([0]));
+  var span = (maxv - minv) || 1, W = 280, H = 46, gap = 3, NS = 'http://www.w3.org/2000/svg';
+  var bw = (W - gap * (vals.length - 1)) / vals.length, zeroY = H - ((0 - minv) / span) * H, curMonth = monthKey(r.from);
+  var svg = document.createElementNS(NS, 'svg');
+  svg.setAttribute('viewBox', '0 0 ' + W + ' ' + H);
+  svg.setAttribute('preserveAspectRatio', 'none');
+  svg.setAttribute('role', 'img');
+  svg.style.cssText = 'display:block;width:100%;height:46px';
+  for (var j = 0; j < vals.length; j++) {
+    if (vals[j] == null) continue;
+    var vy = H - ((vals[j] - minv) / span) * H;
+    var rect = document.createElementNS(NS, 'rect');
+    rect.setAttribute('class', 'tbar ' + (vals[j] >= 0 ? 'good' : 'bad') + (labs[j] === curMonth ? ' cur' : ''));
+    rect.setAttribute('x', (j * (bw + gap)).toFixed(1));
+    rect.setAttribute('y', Math.min(vy, zeroY).toFixed(1));
+    rect.setAttribute('width', bw.toFixed(1));
+    rect.setAttribute('height', Math.max(1.5, Math.abs(zeroY - vy)).toFixed(1));
+    rect.setAttribute('rx', '1.5');
+    rect.setAttribute('data-lab', labs[j] + ' · ' + fmtMoney(Math.abs(vals[j]), false) + (vals[j] >= 0 ? ' above' : ' below'));
+    svg.appendChild(rect);
+  }
+  var holder = el('div', 'tbars-svg');
+  holder.appendChild(svg);
+  attachBarTip(holder);
+  wrap.appendChild(holder);
+  return wrap;
 }
 
 function periodLabel() {

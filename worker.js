@@ -79,6 +79,25 @@ function xeroMonthKey(label) {
   }
   return null;
 }
+/* Break-even inputs (owner asked for a break-even tile per cafe, Oct 2026).
+   The main P&L figures above stay exactly as in the books; these only decide what
+   the break-even maths leaves out or treats as variable:
+   - income left out: landlord incentives ("Other Revenue" is the landlord
+     incentive in the Stones Corner file), Div 7A loan interest, interest, grants
+   - costs left out: income tax, dividends, immediate write-offs, depreciation
+   - variable running costs (move with sales): card/Square fees, packaging,
+     EatClub, delivery-app and delivery costs
+   - fixed cost sitting in Cost of Sales: Kitchen Tools (equipment, not food) */
+const BE_EXCL_INCOME_RE = /landlord|other revenue|div\.?\s*7a|interest income|grants?\b/i;
+const BE_EXCL_COST_RE = /income tax|dividend|immediate write|depreciation|capital gain/i;
+const BE_VAR_OPEX_RE = /merchant|square (fees|third party|chargebacks)|eatclub|uber|door ?dash|menulog|packaging|delivery/i;
+const BE_FIXED_COGS_RE = /kitchen tools/i;
+function xeroBreakEven(c) {
+  const sales = c.revenue - c.beExclIncome;
+  const variable = c.cogs - c.beFixedCogs + c.beVarOpex;
+  const fixed = c.wagesSuper + c.overheads - c.beExclCost - c.beVarOpex + c.beFixedCogs;
+  return { sales: xeroRound(sales), variable: xeroRound(variable), fixed: xeroRound(fixed) };
+}
 /* Parse a Xero P&L report JSON into one column object per period. */
 function xeroParsePnl(rep) {
   const r = rep && rep.Reports && rep.Reports[0];
@@ -86,7 +105,8 @@ function xeroParsePnl(rep) {
   const header = rows.find(function (x) { return x.RowType === 'Header'; });
   const labels = header && header.Cells ? header.Cells.slice(1).map(function (c) { return c.Value; }) : [null];
   const cols = labels.map(function (l) {
-    return { month: xeroMonthKey(l), revenue: 0, cogs: 0, wagesSuper: 0, overheads: 0 };
+    return { month: xeroMonthKey(l), revenue: 0, cogs: 0, wagesSuper: 0, overheads: 0,
+             beExclIncome: 0, beExclCost: 0, beVarOpex: 0, beFixedCogs: 0 };
   });
   const wageAccounts = {}; const otherSections = [];
   rows.forEach(function (sec) {
@@ -98,16 +118,21 @@ function xeroParsePnl(rep) {
       const label = String(row.Cells[0].Value || '');
       cols.forEach(function (col, i) {
         const v = xeroNum(row.Cells[i + 1] && row.Cells[i + 1].Value);
-        if (kind === 'income') col.revenue += v;
-        else if (kind === 'cogs') col.cogs += v;
+        if (kind === 'income') { col.revenue += v; if (BE_EXCL_INCOME_RE.test(label)) col.beExclIncome += v; }
+        else if (kind === 'cogs') { col.cogs += v; if (BE_FIXED_COGS_RE.test(label)) col.beFixedCogs += v; }
         else if (XERO_WAGE_RE.test(label)) { col.wagesSuper += v; wageAccounts[label] = true; }
-        else col.overheads += v;
+        else {
+          col.overheads += v;
+          if (BE_EXCL_COST_RE.test(label)) col.beExclCost += v;
+          else if (BE_VAR_OPEX_RE.test(label)) col.beVarOpex += v;
+        }
       });
     });
   });
   cols.forEach(function (c) {
     c.revenue = xeroRound(c.revenue); c.cogs = xeroRound(c.cogs);
     c.wagesSuper = xeroRound(c.wagesSuper); c.overheads = xeroRound(c.overheads);
+    c.breakEven = xeroBreakEven(c);
   });
   return { cols: cols, wageAccounts: Object.keys(wageAccounts), otherSections: otherSections };
 }
@@ -350,6 +375,7 @@ const ADAPTERS = {
       const c = p.cols[0] || { revenue: 0, cogs: 0, wagesSuper: 0, overheads: 0 };
       return {
         revenue: c.revenue, cogs: c.cogs, wagesSuper: c.wagesSuper, overheads: c.overheads,
+        breakEven: c.breakEven || null,
         wageAccounts: p.wageAccounts, otherSections: p.otherSections
       };
     },
@@ -358,9 +384,10 @@ const ADAPTERS = {
       const loc = q.loc ? findLocation(q.loc) : null;
       const track = loc ? await xeroLocationParams(env, h, loc) : {};
       const months = monthList(q.fromMonth, q.toMonth);
-      const out = { months: months, revenue: [], cogs: [], wagesSuper: [], overheads: [] };
+      const out = { months: months, revenue: [], cogs: [], wagesSuper: [], overheads: [], beSales: [], beVariable: [], beFixed: [] };
       const idx = {}; months.forEach(function (m, i) {
         idx[m] = i; out.revenue.push(null); out.cogs.push(null); out.wagesSuper.push(null); out.overheads.push(null);
+        out.beSales.push(null); out.beVariable.push(null); out.beFixed.push(null);
       });
       for (let i = 0; i < months.length; i += 12) {
         const chunk = months.slice(i, i + 12);
@@ -374,6 +401,7 @@ const ADAPTERS = {
           if (idx[key] === undefined) return;
           out.revenue[idx[key]] = c.revenue; out.cogs[idx[key]] = c.cogs;
           out.wagesSuper[idx[key]] = c.wagesSuper; out.overheads[idx[key]] = c.overheads;
+          if (c.breakEven) { out.beSales[idx[key]] = c.breakEven.sales; out.beVariable[idx[key]] = c.breakEven.variable; out.beFixed[idx[key]] = c.breakEven.fixed; }
         });
       }
       return out;
