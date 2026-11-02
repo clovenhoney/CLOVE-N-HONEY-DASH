@@ -602,6 +602,13 @@ function srcStatus(key) {
   if (!d || !d.sources || !d.sources[key]) return { configured: false };
   return d.sources[key];
 }
+/* No data yet (first load, or just switched cafe): show loading, never "not configured". */
+function notLoadedYet() { return !isManual() && !state.data && !state.fetchError; }
+function loadingValue() {
+  var v = el('div', 'm-value dim');
+  v.innerHTML = '<span class="spin"></span> Loading';
+  return v;
+}
 function isConfigured(key) { var s = srcStatus(key); return !!s.configured; }
 
 function periodValues(slot) {  /* slot: 'cur' | 'prev' | 'yoy' */
@@ -959,6 +966,7 @@ function breakEvenCard(cur, prev, r) {
   var weeks = days / 7;
   card.appendChild(el('span', 'm-tag tag-proj', 'Estimate'));
   card.appendChild(el('div', 'm-label', 'Break-even'));
+  if (notLoadedYet()) { card.appendChild(loadingValue()); return card; }
   if (!isConfigured('accounting')) {
     card.className += ' not-conf';
     card.appendChild(el('div', 'm-value dim', 'Not configured'));
@@ -1087,6 +1095,12 @@ function metricCard(key, cur, prev, yoy, r) {
   var ready = def.needs.every(isConfigured);
   var card = el('div', 'mcard fade-in');
 
+  if (notLoadedYet()) {
+    card.appendChild(el('div', 'm-label', esc(def.label)));
+    card.appendChild(loadingValue());
+    card.appendChild(el('div', 'm-def', esc(def.def)));
+    return card;
+  }
   if (!ready) {
     card.className += ' not-conf';
     card.appendChild(el('div', 'm-label', esc(def.label)));
