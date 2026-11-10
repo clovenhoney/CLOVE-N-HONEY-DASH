@@ -108,7 +108,7 @@ function xeroParsePnl(rep) {
     return { month: xeroMonthKey(l), revenue: 0, cogs: 0, wagesSuper: 0, overheads: 0,
              beExclIncome: 0, beExclCost: 0, beVarOpex: 0, beFixedCogs: 0 };
   });
-  const wageAccounts = {}; const otherSections = [];
+  const wageAccounts = {}; const otherSections = []; const lines = [];
   rows.forEach(function (sec) {
     if (sec.RowType !== 'Section' || !sec.Title) return;
     const kind = xeroSectionKind(sec.Title);
@@ -116,6 +116,7 @@ function xeroParsePnl(rep) {
     (sec.Rows || []).forEach(function (row) {
       if (row.RowType !== 'Row' || !row.Cells) return;
       const label = String(row.Cells[0].Value || '');
+      lines.push({ section: kind, account: label, amounts: cols.map(function (c, i) { return xeroNum(row.Cells[i + 1] && row.Cells[i + 1].Value); }) });
       cols.forEach(function (col, i) {
         const v = xeroNum(row.Cells[i + 1] && row.Cells[i + 1].Value);
         if (kind === 'income') { col.revenue += v; if (BE_EXCL_INCOME_RE.test(label)) col.beExclIncome += v; }
@@ -134,7 +135,7 @@ function xeroParsePnl(rep) {
     c.wagesSuper = xeroRound(c.wagesSuper); c.overheads = xeroRound(c.overheads);
     c.breakEven = xeroBreakEven(c);
   });
-  return { cols: cols, wageAccounts: Object.keys(wageAccounts), otherSections: otherSections };
+  return { cols: cols, wageAccounts: Object.keys(wageAccounts), otherSections: otherSections, lines: lines };
 }
 async function xeroTenant(env, h) {
   const t = await h.getTokens();
@@ -376,7 +377,9 @@ const ADAPTERS = {
       return {
         revenue: c.revenue, cogs: c.cogs, wagesSuper: c.wagesSuper, overheads: c.overheads,
         breakEven: c.breakEven || null,
-        wageAccounts: p.wageAccounts, otherSections: p.otherSections
+        wageAccounts: p.wageAccounts, otherSections: p.otherSections,
+        /* ?detail=1: every P&L account line for the period (read-only; for break-even worksheets) */
+        lines: q.detail ? p.lines.map(function (l) { return { section: l.section, account: l.account, amount: xeroRound(l.amounts[0] || 0) }; }) : undefined
       };
     },
     async fetchMonthly(env, h, q) {
@@ -998,7 +1001,7 @@ async function apiMetrics(env, url) {
   /* Square pages this request may fetch: keeps the whole request under the free
      plan's 50-subrequest cap (Xero uses ~8). Unfinished counts resume next load. */
   const posBudget = { left: Math.max(1, parseInt(env.POS_PAGE_BUDGET || '30', 10) || 30), pending: false };
-  const base = { tz, rollover, loc: location ? location.key : null, posBudget: posBudget };
+  const base = { tz, rollover, loc: location ? location.key : null, posBudget: posBudget, detail: url.searchParams.get('detail') === '1' };
   const [sAcc, sPos, sRos] = await Promise.all([
     sourceStatus(env, 'accounting'),
     sourceStatus(env, 'pos'),
@@ -1013,7 +1016,7 @@ async function apiMetrics(env, url) {
   const cacheKey = 'metricscache:' + [
     url.searchParams.get('cur') || '', url.searchParams.get('prev') || '',
     url.searchParams.get('yoy') || '', url.searchParams.get('trend') || '',
-    tz, rollover, base.loc || 'all'
+    tz, rollover, base.loc || 'all', base.detail ? 'detail' : ''
   ].join('|');
   const force = url.searchParams.get('refresh') === '1';
   let data = null;
