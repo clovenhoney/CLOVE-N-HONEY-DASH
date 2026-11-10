@@ -963,7 +963,9 @@ function breakEvenCalc(be) {
 function breakEvenCard(cur, prev, r) {
   var card = el('div', 'mcard fade-in');
   var days = Math.round((r.to.getTime() - r.from.getTime()) / 86400000) + 1;
-  var weeks = days / 7;
+  /* Same method as the owner's break-even calculator spreadsheet: a year is 52
+     trading weeks, so a period of N days is N/365 of a year = N*52/365 weeks. */
+  var weeks = days * 52 / 365;
   card.appendChild(el('span', 'm-tag tag-proj', 'Estimate'));
   card.appendChild(el('div', 'm-label', 'Break-even'));
   if (notLoadedYet()) { card.appendChild(loadingValue()); return card; }
@@ -982,7 +984,11 @@ function breakEvenCard(cur, prev, r) {
     card.appendChild(el('div', 'm-value dim', '—'));
     card.appendChild(el('div', 'notconf-msg', 'Food and other variable costs came to ' + (calc.varShare * 100).toFixed(1) + '% of sales this period, so no amount of sales covers the fixed costs. Check cost of sales for this period.'));
   } else {
-    var perWeek = calc.point / weeks, perDay = calc.point / days;
+    var perWeek = calc.point / weeks, perYear = perWeek * 52;
+    /* Fri-Sun share of weekly sales, from Square Jul-Oct 2026 (calculator's daily split) */
+    var FRI_SUN_SHARE = { 'stones-corner': 0.6154, 'ormeau': 0.5722, 'all': 0.5978 };
+    var share = FRI_SUN_SHARE[state.loc] || FRI_SUN_SHARE.all;
+    var dayFriSun = perWeek * share / 3, dayMonThu = (perWeek - dayFriSun * 3) / 4;
     var salesWeek = be.sales / weeks, gapWeek = salesWeek - perWeek;
     var above = gapWeek >= 0;
     if (!above) card.className += ' alert';
@@ -992,8 +998,8 @@ function breakEvenCard(cur, prev, r) {
     f1.appendChild(el('div', 'm-unit', 'sales a week'));
     wrap.appendChild(f1);
     var f2 = el('div', 'm-fig sec');
-    f2.appendChild(el('div', 'm-pri', fmtMoney(perDay, false)));
-    f2.appendChild(el('div', 'm-unit', 'a day'));
+    f2.appendChild(el('div', 'm-pri', fmtMoney(perYear, false)));
+    f2.appendChild(el('div', 'm-unit', 'a year'));
     wrap.appendChild(f2);
     card.appendChild(wrap);
 
@@ -1019,13 +1025,15 @@ function breakEvenCard(cur, prev, r) {
       rw.appendChild(el('span', 'cmp-val flat', esc(val)));
       card.appendChild(rw);
     }
+    row('Each day Mon–Thu', fmtMoney(dayMonThu, false));
+    row('Each day Fri–Sun', fmtMoney(dayFriSun, false));
     row('Break-even for this period', fmtMoney(calc.point, false));
     row('Variable costs (food, fees)', (calc.varShare * 100).toFixed(1) + '% of sales');
     row('Fixed costs (wages, rent, overheads)', fmtMoney(be.fixed, false));
     var pc = breakEvenCalc(prev.be);
     if (pc && pc.point != null) {
       var pdays = Math.round((r.prev.to.getTime() - r.prev.from.getTime()) / 86400000) + 1;
-      var pw = pc.point / (pdays / 7);
+      var pw = pc.point / (pdays * 52 / 365);
       var d = perWeek - pw, pct = pw ? (d / pw) * 100 : 0;
       var rw = el('div', 'cmp-row');
       rw.appendChild(el('span', 'cmp-lab', esc(r.prevLabel)));
@@ -1036,7 +1044,7 @@ function breakEvenCard(cur, prev, r) {
     if (days < 28) card.appendChild(el('div', 'm-sub', 'Short periods swing with when rent and wage bills land in Xero. A month or longer reads best.'));
   }
   card.appendChild(breakEvenTrend(r));
-  card.appendChild(el('div', 'm-def', 'Sales needed to cover every cost: fixed costs ÷ (1 − variable costs as a share of sales). Variable: cost of sales (not Kitchen Tools), card and Square fees, packaging, EatClub, delivery. Leaves out landlord incentives, Div 7A interest, income tax, dividends and asset write-offs · from ' + P.accounting));
+  card.appendChild(el('div', 'm-def', 'Same method as your break-even calculator: fixed costs ÷ (1 − variable costs as a share of sales), on a 52-week year; daily targets split by each cafe’s Fri–Sun share of sales in Square. Variable: cost of sales (not Kitchen Tools), card and Square fees, packaging, EatClub, delivery. Leaves out landlord incentives, Div 7A interest, income tax, dividends and asset write-offs · from ' + P.accounting));
   var dec = el('div', 'm-decision');
   dec.appendChild(el('b', null, 'Drives: '));
   dec.appendChild(document.createTextNode('How much trade each cafe needs before it makes a dollar. Lower it by cutting food cost or fixed costs; beat it with more weekday trade.'));
