@@ -587,10 +587,63 @@ function fetchData(force) {
       clearTimeout(state.pendingTimer);
       state.pendingTimer = setTimeout(function () { fetchData(); }, 2500);
     } else if (!json.posPending) { state.pendingTries = 0; }
+    checkWageSplit();
   }).catch(function (err) {
     state.loading = false;
     state.fetchError = 'The dashboard couldn’t fetch data just now. Check the Connections screen, or try refresh.';
     render();
+  });
+}
+
+/* Wage split check (one cafe in view). Each cafe's wages come from Xero's
+   location tracking. If a journal moves pay between periods untagged (e.g. last
+   week's pay run re-tagged to the cafes with a journal dated this week), a cafe's
+   wages cover the wrong weeks while the business total stays right. So fetch the
+   other cafe and both cafes for the current period only (no comparison/trend:
+   one Xero report each, one at a time) and check the cafes add up to the total.
+   If they don't, the cafe's wage %, wages and profit are hidden with a note. */
+function wageCheckKey() { return apiUrl(false); }
+function wageCheckUrl(loc) {
+  var u = apiUrl(false).replace(/&prev=[^&]*/, '').replace(/&yoy=[^&]*/, '').replace(/&trend=[^&]*/, '').replace(/&loc=[^&]*/, '');
+  return u + (loc === 'all' ? '' : '&loc=' + encodeURIComponent(loc));
+}
+function wageSplitBad() {
+  var c = state.wageCheck;
+  return !!(c && c.key === wageCheckKey() && c.status === 'bad');
+}
+function checkWageSplit() {
+  if (isManual() || !state.data || state.loc === 'all' || locList().length < 2) return;
+  var acc = state.data.periods && state.data.periods.cur && state.data.periods.cur.accounting;
+  if (!acc || num(acc.wagesSuper) == null) return;
+  var key = wageCheckKey();
+  if (state.wageCheck && state.wageCheck.key === key) return; /* already checked or checking */
+  var mine = acc.wagesSuper;
+  state.wageCheck = { key: key, status: 'checking' };
+  var others = locList().map(function (l) { return l.key; }).filter(function (k) { return k !== state.loc; }).concat(['all']);
+  var got = {}, urls = {};
+  others.forEach(function (loc) { urls[loc] = wageCheckUrl(loc); }); /* fixed now, in case the view changes mid-check */
+  function getWages(loc, tries) {
+    return fetch(urls[loc]).then(function (res) {
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      return res.json();
+    }).then(function (j) {
+      var a = j.periods && j.periods.cur && j.periods.cur.accounting;
+      if (a && num(a.wagesSuper) != null) return a.wagesSuper;
+      if (tries > 0) return new Promise(function (r) { setTimeout(r, 8000); }).then(function () { return getWages(loc, tries - 1); });
+      throw new Error('no accounting');
+    });
+  }
+  var chain = Promise.resolve();
+  others.forEach(function (loc) { chain = chain.then(function () { return getWages(loc, 3).then(function (w) { got[loc] = w; }); }); });
+  chain.then(function () {
+    if (!state.wageCheck || state.wageCheck.key !== key) return;
+    var sum = mine;
+    others.forEach(function (loc) { if (loc !== 'all') sum += got[loc]; });
+    var gap = Math.round((got.all - sum) * 100) / 100; /* total minus what's tagged to the cafes */
+    state.wageCheck = { key: key, status: Math.abs(gap) > 1 ? 'bad' : 'ok', untagged: gap, total: got.all, tagged: Math.round(sum * 100) / 100 };
+    if (state.wageCheck.status === 'bad') render();
+  }).catch(function () {
+    if (state.wageCheck && state.wageCheck.key === key) state.wageCheck = null; /* couldn't check: try again next load */
   });
 }
 
@@ -622,7 +675,7 @@ function periodValues(slot) {  /* slot: 'cur' | 'prev' | 'yoy' */
   if (acc) {
     out.revenue = num(acc.revenue);
     out.cogs = num(acc.cogs);
-    out.wagesSuper = num(acc.wagesSuper);
+    out.wagesSuper = (slot === 'cur' && wageSplitBad()) ? null : num(acc.wagesSuper);
     out.overheads = num(acc.overheads);
     if (acc.breakEven) out.be = { sales: num(acc.breakEven.sales), variable: num(acc.breakEven.variable), fixed: num(acc.breakEven.fixed) };
   }
@@ -872,6 +925,16 @@ function renderDashboard(root) {
       var lb = el('div', 'banner banner-amber');
       lb.innerHTML = '<b>' + esc(locName(state.loc)) + ' can’t be split out yet.</b> ' + issues.map(esc).join(' ');
       root.appendChild(lb);
+    }
+    if (state.loc !== 'all' && wageSplitBad()) {
+      var wc = state.wageCheck;
+      var wb = el('div', 'banner banner-amber');
+      wb.innerHTML = '<b>' + esc(locName(state.loc)) + '’s wages for this period aren’t reliable, so wage % and profit are hidden.</b> '
+        + 'The cafes’ wages in ' + esc(P.accounting) + ' add up to ' + esc(fmtMoney(wc.tagged, false)) + ', but the business total is '
+        + esc(fmtMoney(wc.total, false)) + ' (' + esc(fmtMoney(Math.abs(wc.untagged), false)) + (wc.untagged < 0 ? ' taken out' : ' added') + ' without a cafe tag). '
+        + 'This usually means a pay run was re-tagged to the cafes with a journal dated in a different week. Ask your bookkeeper to date it in the week the pay belongs to. '
+        + 'Both cafes’ figures are right.';
+      root.appendChild(wb);
     }
   }
 
