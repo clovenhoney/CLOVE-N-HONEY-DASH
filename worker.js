@@ -273,11 +273,37 @@ function posLocationsFor(info, locKey) {
      position is saved in KV and the next load carries on from there;
    - settled past periods are cached for 30 days. */
 function budgetError() { const e = new Error('budget'); e.status = 429; e.budget = true; return e; }
+/* Square records every refund as its OWN completed "return" order (it has a `returns`
+   section and no sale). Those are not sales, so they must come off the count. The refund
+   list gives one entry per return order (refund time = that order's close time), and is
+   a small, cheap call: one per location and date range. Only completed refunds count. */
+async function posRefundOrders(env, locId, q, budget) {
+  const hours = +q.rollover || 0;
+  const begin = zonedToUtcIso(q.from, q.tz, hours);
+  const end = zonedToUtcIso(addDaysStr(q.to, 1), q.tz, hours);
+  let n = 0, cursor = null, first = true;
+  while (first || cursor) {
+    first = false;
+    if (budget.left <= 0) throw budgetError();
+    budget.left--;
+    const p = new URLSearchParams({ begin_time: begin, end_time: end, location_id: locId, status: 'COMPLETED', limit: '100' });
+    if (cursor) p.set('cursor', cursor);
+    const res = await fetch(SQUARE_BASE + '/v2/refunds?' + p.toString(), { headers: posHeaders(env) });
+    if (!res.ok) { const e = new Error('HTTP ' + res.status); e.status = res.status; throw e; }
+    const text = await res.text();
+    let i = 0;
+    while ((i = text.indexOf('"order_id"', i)) !== -1) { n++; i += 10; }
+    const c = /"cursor"\s*:\s*"([^"]+)"/.exec(text);
+    cursor = c ? c[1] : null;
+  }
+  return n;
+}
 async function posCountOne(env, locId, q, budget) {
   const hours = +q.rollover || 0;
-  const key = 'poscnt1:' + [q.from, q.to, q.tz, hours, locId].join('|');
+  const key = 'poscnt2:' + [q.from, q.to, q.tz, hours, locId].join('|'); /* poscnt2: counts net of refund orders */
   const cached = await env.TOKENS.get(key);
   if (cached !== null && cached !== undefined) { const n = parseInt(cached, 10); if (!isNaN(n)) return n; }
+  const refundOrders = await posRefundOrders(env, locId, q, budget);
   const body = {
     location_ids: [locId], limit: 1000, return_entries: true,
     query: { filter: { state_filter: { states: ['COMPLETED'] },
@@ -316,6 +342,7 @@ async function posCountOne(env, locId, q, budget) {
   try { await env.TOKENS.delete(progKey); } catch (e) {}
   const today = new Date().toISOString().slice(0, 10);
   const settled = q.to < addDaysStr(today, -3); /* allow a few days for offline-mode sales to arrive */
+  count = Math.max(0, count - refundOrders);
   try { await env.TOKENS.put(key, String(count), { expirationTtl: settled ? 30 * 86400 : 300 }); } catch (e) {}
   return count;
 }
