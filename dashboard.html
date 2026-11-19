@@ -866,7 +866,7 @@ function render() {
   if (state.fetchError) root.appendChild(el('div', 'banner banner-coral', esc(state.fetchError)));
   if (!isManual() && state.data && state.data.protected === false) {
     var pwb = el('div', 'banner banner-coral');
-    pwb.innerHTML = '<b>No password set yet.</b> Anyone with this link can see your numbers. Ask your AI to set a dashboard password.';
+    pwb.innerHTML = '<b>No password set yet.</b> Anyone with this link can see your numbers. Reload this page and choose a password on the screen that appears.';
     root.appendChild(pwb);
   }
 
@@ -1876,6 +1876,36 @@ function renderSettings(root) {
     var logoutBtn = el('button', 'btn-plain', 'Log out');
     logoutBtn.onclick = function () { fetch('/api/logout', { method: 'POST' }).then(function () { location.reload(); }); };
     root.appendChild(logoutBtn);
+
+    root.appendChild(el('div', 'section-sub', 'Change password'));
+    var pwForm = document.createElement('form');
+    var pwMsg = el('div', 'set-note', 'Use at least 10 characters. Changing it logs out every other device.');
+    function pwInput(ph, ac) {
+      var i = document.createElement('input'); i.type = 'password'; i.placeholder = ph; i.autocomplete = ac;
+      i.style.display = 'block'; i.style.margin = '0 0 8px'; i.style.padding = '8px 10px'; i.style.minWidth = '240px';
+      return i;
+    }
+    var pwCur = pwInput('Current password', 'current-password');
+    var pwNew = pwInput('New password', 'new-password');
+    var pwNew2 = pwInput('Confirm new password', 'new-password');
+    var pwBtn = el('button', 'btn-plain', 'Change password'); pwBtn.type = 'submit';
+    pwForm.appendChild(pwCur); pwForm.appendChild(pwNew); pwForm.appendChild(pwNew2); pwForm.appendChild(pwBtn); pwForm.appendChild(pwMsg);
+    pwForm.onsubmit = function (ev) {
+      ev.preventDefault();
+      if (pwNew.value.length < 10) { pwMsg.textContent = 'Use at least 10 characters.'; return; }
+      if (pwNew.value !== pwNew2.value) { pwMsg.textContent = 'The two new passwords do not match.'; return; }
+      pwMsg.textContent = 'Saving…';
+      fetch('/api/setup', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ current: pwCur.value, passcode: pwNew.value }) })
+        .then(function (r) {
+          if (r.ok) { pwCur.value = pwNew.value = pwNew2.value = ''; pwMsg.textContent = 'Password changed. Other devices are logged out.'; }
+          else if (r.status === 401) pwMsg.textContent = 'Your current password did not match.';
+          else if (r.status === 429) pwMsg.textContent = 'Too many tries. Wait 15 minutes and try again.';
+          else pwMsg.textContent = 'Could not change it. Try again.';
+        })
+        .catch(function () { pwMsg.textContent = 'Something went wrong. Try again.'; });
+    };
+    root.appendChild(pwForm);
   }
 }
 

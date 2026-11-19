@@ -119,7 +119,7 @@ function xeroParsePnl(rep) {
       lines.push({ section: kind, account: label, amounts: cols.map(function (c, i) { return xeroNum(row.Cells[i + 1] && row.Cells[i + 1].Value); }) });
       cols.forEach(function (col, i) {
         const v = xeroNum(row.Cells[i + 1] && row.Cells[i + 1].Value);
-        if (kind === 'income') { col.revenue += v; if (BE_EXCL_INCOME_RE.test(label)) col.beExclIncome += v; }
+        if (kind === 'income') { if (!BE_EXCL_INCOME_RE.test(label)) col.revenue += v; } /* trading income only: landlord incentives, Div 7A, interest, grants stay out */
         else if (kind === 'cogs') { col.cogs += v; if (BE_FIXED_COGS_RE.test(label)) col.beFixedCogs += v; }
         else if (XERO_WAGE_RE.test(label)) { col.wagesSuper += v; wageAccounts[label] = true; }
         else {
@@ -137,13 +137,17 @@ function xeroParsePnl(rep) {
   });
   return { cols: cols, wageAccounts: Object.keys(wageAccounts), otherSections: otherSections, lines: lines };
 }
+/* The organisation the dashboard reads. If this one is connected it is always used,
+   so a second connected organisation can never silently take its place. */
+const XERO_PREFERRED_TENANT = 'f85812ef-10a6-4c83-9156-572e908c3edc'; /* CLOVE N HONEY */
 async function xeroTenant(env, h) {
   const t = await h.getTokens();
   const stamp = (t && t.obtained_at) || '';
   const raw = await env.TOKENS.get('xerotenant');
-  if (raw) { try { const c = JSON.parse(raw); if (c && c.id && c.stamp === stamp) return c; } catch (e) {} }
+  if (raw) { try { const c = JSON.parse(raw); if (c && c.id && c.stamp === stamp && c.id === XERO_PREFERRED_TENANT) return c; } catch (e) {} }
   const list = await h.fetchJson('https://api.xero.com/connections', { headers: { 'Accept': 'application/json' } });
-  const first = Array.isArray(list) ? list[0] : null;
+  const first = Array.isArray(list)
+    ? (list.find(function (t) { return t && t.tenantId === XERO_PREFERRED_TENANT; }) || list[0]) : null;
   if (!first || !first.tenantId) { const e = new Error('no organisation'); e.status = 403; throw e; }
   const c = { id: first.tenantId, name: first.tenantName || '', stamp: stamp };
   await env.TOKENS.put('xerotenant', JSON.stringify(c));
@@ -238,7 +242,7 @@ function addDaysStr(s, n) {
 /* Business name + active locations (cached an hour per token). */
 async function posInfo(env, h) {
   const tok = String(env.POS_API_TOKEN || '');
-  const key = 'posinfo:' + tok.slice(-8);
+  const key = 'posinfo:' + (await shaB64(tok)).slice(0, 12);
   const raw = await env.TOKENS.get(key);
   if (raw) { try { return JSON.parse(raw); } catch (e) {} }
   const hdr = { headers: posHeaders(env) };
@@ -698,7 +702,11 @@ async function validSession(env, token) {
   const payload = token.slice(0, i);
   if (!timingSafeEqual(token.slice(i + 1), await hmacB64(await getSessionKey(env), payload))) return false;
   const issued = parseInt(payload.split('.')[1], 10);
-  return !!issued && (Date.now() / 1000 - issued) <= SESSION_TTL;
+  if (!issued || (Date.now() / 1000 - issued) > SESSION_TTL) return false;
+  if (env.TOKENS) { /* a password change cancels every login issued before it */
+    try { const ep = parseInt(await env.TOKENS.get('sys:session_epoch'), 10); if (ep && issued < ep) return false; } catch (e) {}
+  }
+  return true;
 }
 function getCookie(request, name) {
   const m = (request.headers.get('Cookie') || '').match(new RegExp('(?:^|; )' + name + '=([^;]*)'));
@@ -708,7 +716,16 @@ async function isLoggedIn(request, env) {
   return await validSession(env, getCookie(request, 'vd_session'));
 }
 function htmlResponse(html) {
-  return new Response(html, { headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store', 'X-Frame-Options': 'DENY', 'Referrer-Policy': 'no-referrer' } });
+  return new Response(html, { headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store', 'X-Frame-Options': 'DENY', 'Referrer-Policy': 'no-referrer', 'X-Content-Type-Options': 'nosniff', 'Strict-Transport-Security': 'max-age=31536000' } });
+}
+/* Checks a typed password against the stored one (env override or KV hash). */
+async function verifyPasscode(env, passcode) {
+  if (env.DASHBOARD_PASSCODE) return timingSafeEqual(await shaB64(passcode), await shaB64(env.DASHBOARD_PASSCODE));
+  if (!env.TOKENS) return false;
+  const stored = await env.TOKENS.get('sys:passcode_hash');
+  if (!stored) return false;
+  const dot = stored.indexOf('.');
+  return timingSafeEqual(await pbkdf2B64(passcode, stored.slice(0, dot)), stored.slice(dot + 1));
 }
 async function apiLogin(env, request) {
   if (!(await passcodeSet(env))) return json({ ok: false, error: 'no_passcode' }, 400);
@@ -748,9 +765,23 @@ async function apiSetup(env, request) {
   let body; try { body = await request.json(); } catch (e) { return json({ ok: false }, 400); }
   const passcode = String((body && body.passcode) || '');
   if (passcode.length < 10) return json({ ok: false, error: 'too_short' }, 400);
+  const isChange = await passcodeSet(env);
+  if (isChange) {
+    if (env.DASHBOARD_PASSCODE) return json({ ok: false, error: 'env_managed' }, 400);
+    const ip = request.headers.get('CF-Connecting-IP') || 'unknown';
+    const failKey = 'sys:fail:' + ip;
+    let fails = 0;
+    try { fails = parseInt(await env.TOKENS.get(failKey), 10) || 0; } catch (e) {}
+    if (fails >= 5) return json({ ok: false, error: 'locked' }, 429);
+    if (!(await verifyPasscode(env, String((body && body.current) || '')))) {
+      try { await env.TOKENS.put(failKey, String(fails + 1), { expirationTtl: 900 }); } catch (e) {}
+      return json({ ok: false, error: 'wrong_current' }, 401);
+    }
+  }
   const saltB = new Uint8Array(16); crypto.getRandomValues(saltB);
   const saltHex = Array.from(saltB).map((x) => x.toString(16).padStart(2, '0')).join('');
   await env.TOKENS.put('sys:passcode_hash', saltHex + '.' + (await pbkdf2B64(passcode, saltHex)));
+  await env.TOKENS.put('sys:session_epoch', String(Math.floor(Date.now() / 1000))); /* log everyone else out */
   const token = await makeSession(env);
   return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store', 'Set-Cookie': 'vd_session=' + encodeURIComponent(token) + '; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=' + SESSION_TTL } });
 }
@@ -957,7 +988,9 @@ async function apiIngest(env, request, url) {
 function parseRange(s) {
   if (!s) return null;
   const m = /^(\d{4}-\d{2}-\d{2}):(\d{4}-\d{2}-\d{2})$/.exec(s);
-  return m ? { from: m[1], to: m[2] } : null;
+  if (!m) return null;
+  const ok = function (d) { const t = new Date(d + 'T00:00:00Z'); return !isNaN(t.getTime()) && t.toISOString().slice(0, 10) === d; };
+  return (ok(m[1]) && ok(m[2]) && m[1] <= m[2]) ? { from: m[1], to: m[2] } : null;
 }
 function parseMonthRange(s) {
   if (!s) return null;
@@ -1031,7 +1064,8 @@ async function apiMetrics(env, url) {
   const prev = parseRange(url.searchParams.get('prev'));
   const yoy = parseRange(url.searchParams.get('yoy'));
   const trend = parseMonthRange(url.searchParams.get('trend'));
-  const tz = url.searchParams.get('tz') || 'Australia/Sydney';
+  let tz = url.searchParams.get('tz') || 'Australia/Brisbane';
+  try { new Intl.DateTimeFormat('en-US', { timeZone: tz }); } catch (e) { tz = 'Australia/Brisbane'; }
   const rollover = Math.max(0, Math.min(6, parseInt(url.searchParams.get('rollover') || '0', 10) || 0));
 
   const location = findLocation(url.searchParams.get('loc') || '');
@@ -1150,7 +1184,7 @@ function alignSeries(months, series) {
 function json(obj, status) {
   return new Response(JSON.stringify(obj), {
     status: status || 200,
-    headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' }
+    headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff' }
   });
 }
 
