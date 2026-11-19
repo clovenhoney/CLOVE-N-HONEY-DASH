@@ -714,6 +714,12 @@ async function apiLogin(env, request) {
   if (!(await passcodeSet(env))) return json({ ok: false, error: 'no_passcode' }, 400);
   let body; try { body = await request.json(); } catch (e) { return json({ ok: false }, 400); }
   const passcode = String((body && body.passcode) || '');
+  /* Lockout: 5 wrong tries from one address locks that address for 15 minutes. */
+  const ip = request.headers.get('CF-Connecting-IP') || 'unknown';
+  const failKey = 'sys:fail:' + ip;
+  let fails = 0;
+  if (env.TOKENS) { try { fails = parseInt(await env.TOKENS.get(failKey), 10) || 0; } catch (e) {} }
+  if (fails >= 5) return json({ ok: false, error: 'locked' }, 429);
   let okPass = false;
   if (env.DASHBOARD_PASSCODE) {
     okPass = timingSafeEqual(await shaB64(passcode), await shaB64(env.DASHBOARD_PASSCODE));
@@ -724,7 +730,11 @@ async function apiLogin(env, request) {
       okPass = timingSafeEqual(await pbkdf2B64(passcode, stored.slice(0, dot)), stored.slice(dot + 1));
     }
   }
-  if (!okPass) return json({ ok: false }, 401);
+  if (!okPass) {
+    if (env.TOKENS) { try { await env.TOKENS.put(failKey, String(fails + 1), { expirationTtl: 900 }); } catch (e) {} }
+    return json({ ok: false }, 401);
+  }
+  if (env.TOKENS && fails) { try { await env.TOKENS.delete(failKey); } catch (e) {} }
   const token = await makeSession(env);
   return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store', 'Set-Cookie': 'vd_session=' + encodeURIComponent(token) + '; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=' + SESSION_TTL } });
 }
@@ -737,7 +747,7 @@ async function apiSetup(env, request) {
   if ((await passcodeSet(env)) && !(await isLoggedIn(request, env))) return json({ ok: false, error: 'exists' }, 403);
   let body; try { body = await request.json(); } catch (e) { return json({ ok: false }, 400); }
   const passcode = String((body && body.passcode) || '');
-  if (passcode.length < 6) return json({ ok: false, error: 'too_short' }, 400);
+  if (passcode.length < 10) return json({ ok: false, error: 'too_short' }, 400);
   const saltB = new Uint8Array(16); crypto.getRandomValues(saltB);
   const saltHex = Array.from(saltB).map((x) => x.toString(16).padStart(2, '0')).join('');
   await env.TOKENS.put('sys:passcode_hash', saltHex + '.' + (await pbkdf2B64(passcode, saltHex)));
@@ -767,7 +777,7 @@ function loginPage() {
     + 'var f=document.getElementById("f");'
     + 'f.onsubmit=function(ev){ev.preventDefault();var e=document.getElementById("e");e.textContent="";'
     + 'fetch("/api/login",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({passcode:document.getElementById("p").value})})'
-    + '.then(function(r){if(r.ok){location.reload();}else{e.textContent="That password did not match. Try again.";}})'
+    + '.then(function(r){if(r.ok){location.reload();}else if(r.status===429){e.textContent="Too many tries. Wait 15 minutes and try again.";}else{e.textContent="That password did not match. Try again.";}})'
     + '.catch(function(){e.textContent="Something went wrong. Try again.";});};'
     + '</script></body></html>';
 }
@@ -785,7 +795,7 @@ function setupPage() {
     + 'button{width:100%;margin-top:12px;padding:13px;font-size:15px;font-weight:500;font-family:"DM Sans",sans-serif;color:#0D0D0D;background:#F2A900;border:none;border-radius:10px;cursor:pointer}'
     + '.err{color:#C04B28;font-size:13px;margin-top:10px;min-height:16px}'
     + '</style></head><body>'
-    + '<div class="box"><h1>Set your password</h1><p>Choose a password for your dashboard. You\u2019ll type it each time you open it - pick something only you and your team know, at least 6 characters.</p>'
+    + '<div class="box"><h1>Set your password</h1><p>Choose a password for your dashboard. You\u2019ll type it each time you open it - pick something only you and your team know, at least 10 characters.</p>'
     + '<form id="f"><input id="p" type="password" autocomplete="new-password" placeholder="New password" autofocus>'
     + '<input id="p2" type="password" autocomplete="new-password" placeholder="Confirm password" style="margin-top:10px">'
     + '<button type="submit">Save and open my dashboard</button><div class="err" id="e"></div></form></div>'
@@ -793,7 +803,7 @@ function setupPage() {
     + 'var f=document.getElementById("f");'
     + 'f.onsubmit=function(ev){ev.preventDefault();var e=document.getElementById("e");e.textContent="";'
     + 'var p=document.getElementById("p").value,p2=document.getElementById("p2").value;'
-    + 'if(p.length<6){e.textContent="Use at least 6 characters.";return;}'
+    + 'if(p.length<6){e.textContent="Use at least 10 characters.";return;}'
     + 'if(p!==p2){e.textContent="The two passwords do not match.";return;}'
     + 'fetch("/api/setup",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({passcode:p})})'
     + '.then(function(r){if(r.ok){location.reload();}else{e.textContent="Could not save that. Try again.";}})'
